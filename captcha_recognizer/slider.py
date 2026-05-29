@@ -1,3 +1,22 @@
+"""
+滑块验证码识别核心模块
+========================
+基于 YOLOv8-seg（实例分割）的 ONNX 模型，识别滑块验证码的滑块和缺口位置。
+
+整体流程：
+  原始图片 → 预处理(letterbox+归一化) → ONNX模型推理 → 后处理(NMS+掩膜) → 滑块/缺口坐标
+
+主要对外方法：
+  identify(source)        → 返回 (gap_box, confidence)  旧版接口，只返回缺口
+  identify_both(source)   → 返回 dict，包含滑块+缺口+偏移量  新版接口
+  identify_offset(source) → 返回 (offset, confidence)  只返回滑块x坐标
+
+关键参数（可调，改这里调整识别灵敏度）：
+  CONF_THRESHOLD = 0.5   置信度阈值，低于此值的目标会被丢弃
+  IOU_THRESHOLD  = 0.8   NMS 用的 IoU 阈值
+  Y_IOU_THRESHOLD = 0.85 Y轴方向 IoU 阈值，用于区分滑块和缺口
+"""
+
 import base64
 import os
 import random
@@ -5,39 +24,65 @@ import time
 from pathlib import Path
 from typing import List, Tuple, Union
 
-import cv2
-import numpy as np
-import onnxruntime as ort
-from shapely.geometry import Polygon
+import cv2      # OpenCV：图片读写、缩放、绘制
+import numpy as np  # 数值计算
+import onnxruntime as ort  # ONNX 模型推理引擎
+from shapely.geometry import Polygon  # 多边形几何计算（计算IoU用）
 
-CONF_THRESHOLD = 0.5
 
-IOU_THRESHOLD = 0.8
+# ============================================================
+# 全局阈值参数（改这里可以调整识别的灵敏度）
+# ============================================================
 
-Y_IOU_THRESHOLD = 0.85
+CONF_THRESHOLD = 0.5    # 置信度阈值：模型认为"这可能是缺口"的最低分数
+                       # 调低 → 识别更多目标（可能误报增多）
+                       # 调高 → 只保留高置信度结果（可能漏报）
+
+IOU_THRESHOLD = 0.8    # NMS（非极大值抑制）的 IoU 阈值
+                       # 两个框重叠度超过此值，只保留分数更高的那个
+
+Y_IOU_THRESHOLD = 0.85  # Y轴方向 IoU 阈值，用于 pick_out_mask
+                        # 判断两个目标是否在"同一水平线"上（滑块和缺口通常y位置接近）
 
 
 class Slider:
 
     def __init__(self):
         """
-        Initialize the instance segmentation model using an ONNX model.
+        初始化：加载 ONNX 模型文件
+        模型路径: captcha_recognizer/models/slider.onnx
         """
         root_dir = os.path.dirname(os.path.dirname(__file__))
         slider_model_path = os.path.join(root_dir, 'captcha_recognizer', 'models', 'slider.onnx')
 
+        # 根据是否有 GPU 选择推理设备
+        # HF Spaces 免费层没有 GPU，所以通常走 CPUExecutionProvider
         self.session = ort.InferenceSession(
             slider_model_path,
             providers=["CUDAExecutionProvider", "CPUExecutionProvider"] if ort.get_device() == 'GPU' else [
                 "CPUExecutionProvider"],
         )
 
+        # 模型类别：只有一类 's'（slider/缺口）
+        # 如果以后换成多类别模型，这里要加
         self.classes = {0: 's'}
+
+    # ============================================================
+    # 核心推理流程
+    # ============================================================
 
     def predict(self, img: np.ndarray, conf: float = 0.25, iou: float = 0.7,
                 imgsz: Union[int, Tuple[int, int]] = 640) -> List:
         """
-        Run inference on the input image using the ONNX model.
+        完整推理流程：预处理 → 模型推理 → 后处理
+        
+        参数：
+          img:   原始图片（BGR格式的numpy数组）
+          conf:  置信度阈值（传给NMS）
+          iou:   IoU阈值（传给NMS）
+          imgsz: 模型输入尺寸，默认640x640
+                  ↑ 更大=更准但更慢，更小=更快但可能不准
+                  ↑ 常见值: 320, 640, 1280
         """
         imgsz = (imgsz, imgsz) if isinstance(imgsz, int) else imgsz
         prep_img = self.preprocess(img, imgsz)
@@ -47,35 +92,41 @@ class Slider:
     @staticmethod
     def letterbox(img: np.ndarray, new_shape: Tuple[int, int] = (640, 640)) -> np.ndarray:
         """
-        Resize and pad image while maintaining aspect ratio.
-        Returns exactly new_shape sized image.
+        Letterbox 缩放：保持宽高比缩放图片，不足部分用灰色(114,114,114)填充
+        
+        为什么不直接 resize？因为直接拉伸会变形，影响识别准确率。
+        Letterbox 相当于"等比缩放 + 补边"，是 YOLO 系列模型的标准做法。
+        
+        示例：原图 300x200，目标 640x640
+          → 等比缩放到 640x427
+          → 上下各补 106 像素灰色边，最终 640x640
         """
-        shape = img.shape[:2]  # current shape [height, width]
+        shape = img.shape[:2]  # 当前尺寸 [height, width]
 
-        # Calculate ratio and new dimensions
+        # 计算缩放比例（取宽高比中较小的，保证整个图片都能放下）
         r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
         new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
 
-        # Ensure new dimensions are at least 1 and not larger than target
+        # 确保尺寸不越界
         new_unpad = (max(1, min(new_unpad[0], new_shape[1])),
                      max(1, min(new_unpad[1], new_shape[0])))
 
-        # Resize if needed
+        # 缩放
         if shape[::-1] != new_unpad:
             img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
 
-        # Calculate padding
+        # 计算需要填充的像素数
         dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]
         dw, dh = float(dw), float(dh)
 
-        # Divide padding into 2 sides
+        # 上下、左右各填一半
         top, bottom = int(round(dh / 2)), int(round(dh / 2))
         left, right = int(round(dw / 2)), int(round(dw / 2))
 
-        # Add padding
+        # 填充灰色边
         img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114))
 
-        # Final check to ensure exact size (might need crop if rounding caused overflow)
+        # 最终确保精确尺寸（防止四舍五入导致差1像素）
         if img.shape[0] != new_shape[0] or img.shape[1] != new_shape[1]:
             img = cv2.resize(img, new_shape, interpolation=cv2.INTER_LINEAR)
 
@@ -83,32 +134,53 @@ class Slider:
 
     def preprocess(self, img: np.ndarray, new_shape: Tuple[int, int]) -> np.ndarray:
         """
-        Preprocess the input image before feeding it into the model.
+        图片预处理：letterbox缩放 → BGR转RGB → 转置 → 归一化
+        
+        处理后格式: (1, 3, 640, 640) float32，值域 [0, 1]
+        这是 YOLO 模型的标准输入格式
         """
-        img = self.letterbox(img, new_shape)
-        img = img[..., ::-1].transpose([2, 0, 1])[None]
-        img = np.ascontiguousarray(img)
-        img = img.astype(np.float32) / 255
+        img = self.letterbox(img, new_shape)     # 等比缩放+填充
+        img = img[..., ::-1].transpose([2, 0, 1])[None]  # BGR→RGB, HWC→CHW, 加batch维度
+        img = np.ascontiguousarray(img)          # 确保内存连续
+        img = img.astype(np.float32) / 255       # 归一化到 0~1
         return img
 
     def postprocess(self, img: np.ndarray, prep_img: np.ndarray, outs: List, conf: float = 0.25,
                     iou: float = 0.7) -> List:
         """
-        Post-process model predictions to extract meaningful results.
+        后处理：模型输出 → 有意义的检测框和掩膜
+        
+        模型输出两个部分：
+          preds:  检测框 + 类别 + 置信度
+          protos: 掩膜原型（用于生成分割掩膜）
         """
         preds, protos = outs
         preds = self.non_max_suppression(preds, conf, iou, nc=len(self.classes))
 
         results = []
         for i, pred in enumerate(preds):
+            if len(pred) == 0:
+                results.append([pred, None])
+                continue
+            # 把检测框从模型输入坐标映射回原图坐标
             pred[:, :4] = self.scale_boxes(prep_img.shape[2:], pred[:, :4], img.shape)
+            # 用掩膜原型 + 检测框系数 → 生成分割掩膜
             masks = self.process_mask(protos[i], pred[:, 6:], pred[:, :4], img.shape[:2])
             results.append([pred[:, :6], masks])
 
         return results
 
+    # ============================================================
+    # 掩膜处理相关
+    # ============================================================
+
     def process_mask(self, protos: np.ndarray, masks_in: np.ndarray, bboxes: np.ndarray,
                      shape: Tuple[int, int]) -> np.ndarray:
+        """
+        从掩膜原型生成最终的二值掩膜
+        
+        原理：掩膜系数 × 掩膜原型 = 每个目标的分割掩膜
+        """
         c, mh, mw = protos.shape
         masks = (masks_in @ protos.reshape(c, -1)).reshape(-1, mh, mw)
         masks = self.scale_masks(masks, shape)
@@ -118,47 +190,35 @@ class Slider:
     @staticmethod
     def masks_to_segments(masks: Union[np.ndarray,], strategy: str = "largest") -> List[np.ndarray]:
         """
-        将二值Mask转换为多边形边界点(segments)，不使用多边形简化
-
-        参数:
-            masks: 输入的二值Mask，可以是numpy数组或torch张量
-                  形状为(batch_size, height, width)或(height, width)
-            strategy: 处理多个轮廓的策略:
-                     'all' - 合并所有轮廓
-                     'largest' - 只保留最大轮廓
-                     'none' - 返回所有轮廓不合并
-
-        返回:
-            包含多边形点集的列表，每个元素是(N,2)的numpy数组
+        将二值掩膜转换为多边形轮廓点
+        
+        为什么需要这个？因为后面要计算两个多边形的 IoU
+        来判断哪个是滑块、哪个是缺口
+        
+        strategy:
+          'largest' - 只保留最大轮廓（默认，适合大多数情况）
+          'all'     - 合并所有轮廓
+          'none'    - 保留所有轮廓不合并
         """
-        # 转换输入为numpy数组
-
         masks_np = masks.astype("uint8")
 
-        # 处理单张mask的情况
         if masks_np.ndim == 2:
             masks_np = masks_np[np.newaxis, ...]
 
         segments = []
-
         for mask in masks_np:
-            # 查找轮廓 (OpenCV 4.x返回格式)
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-            if not contours:  # 没有找到轮廓
+            if not contours:
                 segments.append(np.zeros((0, 2), dtype=np.float32))
                 continue
 
-            # 根据策略处理多个轮廓
             if strategy == "all" and len(contours) > 1:
-                # 合并所有轮廓，保留所有点
                 contour = np.concatenate([x.reshape(-1, 2) for x in contours])
             elif strategy == "largest":
-                # 选择最长的轮廓，保留所有点
                 contour = max(contours, key=lambda x: cv2.arcLength(x, closed=True))
                 contour = contour.reshape(-1, 2)
-            else:  # 'none'策略或其他情况
-                # 不合并轮廓，保留所有点
+            else:
                 contour = contours[0].reshape(-1, 2)
 
             segments.append(contour.astype(np.float32))
@@ -168,157 +228,148 @@ class Slider:
     @staticmethod
     def draw_segments(image, boxes, masks,
                       mask_alpha=0.5, box_thickness=2, draw_labels=True):
-
         """
-        在图像上绘制预测框和掩膜
-
-        参数:
-            image: 原始图像 (numpy数组, BGR格式)
-            boxes: 预测框列表, 格式为 [[x1, y1, x2, y2, score, class_id], ...]
-            masks: 掩膜列表, 每个掩膜为二值图像 (0或255)
-            box_color: 框的颜色 (BGR格式), 如果为None则随机生成
-            mask_alpha: 掩膜透明度 (0-1)
-            box_thickness: 框的线宽
-            draw_labels: 是否绘制类别和置信度标签
-
-        返回:
-            绘制后的图像
+        在图片上绘制检测框和掩膜（调试用，API服务中不会调用）
         """
-        # 创建输出图像的副本
         output = image.copy()
 
-        # 如果没有提供boxes和masks，直接返回原图
         if boxes is None and masks is None:
             return output
 
-        # 绘制masks
         if masks is not None:
-            # 创建一个空的彩色掩膜图像
             color_mask = np.zeros_like(image)
-
             for i, mask in enumerate(masks):
-                # 为每个mask生成随机颜色或使用指定颜色
-
                 color = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
-                # 将二值mask转换为彩色mask
                 mask = mask.astype(bool)
                 color_mask[mask] = color
-
-            # 将彩色掩膜与原始图像混合
             output = cv2.addWeighted(output, 1, color_mask, mask_alpha, 0)
 
-        # 绘制boxes
         if boxes is not None:
             for box in boxes:
-                x1, y1, x2, y2, score, class_id = box[:6]  # 只取前6个值，兼容不同格式
-
-                # 为每个box生成随机颜色或使用指定颜色
-
+                x1, y1, x2, y2, score, class_id = box[:6]
                 color = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
-
-                # 绘制矩形框
                 cv2.rectangle(output, (int(x1), int(y1)), (int(x2), int(y2)), color, box_thickness)
-
-                # 绘制标签
                 if draw_labels:
                     label = f"{int(class_id)}: {score:.2f}"
                     (label_width, label_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-
-                    # 绘制标签背景
                     cv2.rectangle(output, (int(x1), int(y1) - label_height - 5),
                                   (int(x1) + label_width, int(y1)), color, -1)
-                    # 绘制标签文本
                     cv2.putText(output, label, (int(x1), int(y1) - 5),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
 
         return output
 
+    # ============================================================
+    # 图片输入处理
+    # ============================================================
+
     @staticmethod
     def image_to_array(source: Union[str, Path, bytes, np.ndarray] = None):
+        """
+        把各种格式的输入统一转成 OpenCV 图片（numpy数组）
+        
+        支持的输入：
+          - base64 字符串（data:image/png;base64,...）
+          - 文件路径
+          - 字节流
+          - 已经是 numpy 数组的（直接返回）
+        """
         if isinstance(source, str) and source.startswith('data:image'):
-            # 从Base64字符串读取
             header, encoded = source.split(',', 1)
             data = base64.b64decode(encoded)
             np_arr = np.frombuffer(data, np.uint8)
             return cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
         elif isinstance(source, (str, Path)):
-            # 从文件路径读取
             return cv2.imread(str(source))
         elif isinstance(source, bytes):
-            # 从字节流读取
             np_arr = np.frombuffer(source, np.uint8)
             return cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
         elif isinstance(source, np.ndarray):
-            # 如果已经是 numpy 数组，直接使用
             return source
         else:
             raise TypeError("Unsupported source type. Only str, Path, bytes, or numpy.ndarray are supported.")
 
+    # ============================================================
+    # IoU 计算相关（用于区分滑块和缺口）
+    # ============================================================
+
     @staticmethod
     def normalize_points(points):
-        """
-        将点集归一化到以原点为中心
-        :param points: 点集
-        :return: 归一化后的点集
-        """
-        # 计算质心
+        """将多边形点集归一化到以质心为原点（用于形状比较，消除位置影响）"""
         centroid = np.mean(points, axis=0)
-        # 将质心移到原点
         normalized_points = points - centroid
         return normalized_points
 
     @staticmethod
     def y_iou(segment1, segment2):
-        # 计算交集
+        """
+        计算 Y 轴方向的一维 IoU
+        
+        用途：判断两个目标是否在同一水平线上
+        滑块和缺口通常 y 坐标接近（在同一高度），而背景干扰物可能在不同高度
+        """
         start = max(segment1[0], segment2[0])
         end = min(segment1[1], segment2[1])
-        intersection = max(0, end - start)  # 确保没有负值（无重叠时返回0）
+        intersection = max(0, end - start)
 
-        # 计算并集
         len1 = segment1[1] - segment1[0]
         len2 = segment2[1] - segment2[0]
         union = len1 + len2 - intersection
 
-        # 计算 IoU
-        iou = intersection / union if union != 0 else 0  # 避免除以0
+        iou = intersection / union if union != 0 else 0
         return iou
 
     def polygon_iou(self, poly1, poly2):
         """
-        计算两个多边形的 IoU
-        :param poly1: 多边形1的顶点坐标，格式为 [[x1,y1], [x2,y2], ..., [xn,yn]]
-        :param poly2: 多边形2的顶点坐标，格式同上
-        :return: IoU 值（范围 [0, 1]）
+        计算两个多边形的形状 IoU（先归一化位置，只比较形状相似度）
+        
+        用途：滑块的形状和缺口的形状通常相似（都是拼图块形状）
+        通过比较形状 IoU 来判断哪个目标是缺口
         """
-        # 归一化处理到原点
         p1 = self.normalize_points(poly1)
         p2 = self.normalize_points(poly2)
 
-        poly1 = Polygon(p1).buffer(0)  # buffer(0) 修复无效多边形（如自相交）
+        poly1 = Polygon(p1).buffer(0)  # buffer(0) 修复自相交等无效多边形
         poly2 = Polygon(p2).buffer(0)
-        # poly2 = Polygon(normalize_points(poly2))
 
-        # if not poly1.is_valid or not poly2.is_valid:
-        #     return 0.0  # 无效多边形（如面积为零）
-
-        # 计算交集和并集面积
         intersect = poly1.intersection(poly2).area
         union = poly1.union(poly2).area
 
-        # 计算 IoU
         iou = intersect / union if union > 0 else 0.0
         return iou
 
+    # ============================================================
+    # 核心：从多个检测目标中区分滑块和缺口
+    # ============================================================
+
     def pick_out_mask(self, boxes: list, segments):
-        # boxes, masks 为两个列表，找出box值最小的一个
+        """
+        从多个检测目标中区分滑块和缺口
+        
+        返回: (slider_box, gap_box)
+          slider_box: 滑块（x最小的检测框，通常在图片左侧）
+          gap_box: 缺口（与滑块形状最相似的目标，通常在图片右侧）
+        
+        策略：
+        1. 找 x 坐标最小的目标 → 这通常是滑块（在图片左侧）
+        2. 在剩余目标中，找 y 位置与滑块接近的（同一水平线）
+        3. 在同水平线的目标中，找形状与滑块最相似的 → 这就是缺口
+        
+        为什么这样判断？
+        - 滑块验证码的布局：滑块在左，缺口在右
+        - 滑块和缺口形状相同（都是拼图块），但位置不同
+        - 背景干扰物形状不同，且可能不在同一水平线
+        """
+        # 第一步：找 x 最小的 = 滑块
         box_slider = min(boxes, key=lambda x: x[0])
         box_slider_index = boxes.index(box_slider)
         segment_slider = segments[box_slider_index]
 
+        # 剩余目标（排除滑块）
         box_sample = boxes[:box_slider_index] + boxes[box_slider_index + 1:]
         segment_sample = segments[:box_slider_index] + segments[box_slider_index + 1:]
 
-        # 先按照y值iou过滤
+        # 第二步：Y轴方向 IoU 过滤（只保留同一水平线的目标）
         box_filtered = []
         segment_filtered = []
 
@@ -326,14 +377,15 @@ class Slider:
             if self.y_iou([box_slider[1], box_slider[3]], [box[1], box[3]]) > Y_IOU_THRESHOLD:
                 box_filtered.append(box)
                 segment_filtered.append(segment_sample[index])
-        # 如果通过y轴iou没有过滤掉有效值，则从所有box中选择iou最大的一个
+        # 如果Y轴过滤没有保留任何目标，退回到全部候选
         if not box_filtered:
             box_filtered = box_sample
             segment_filtered = segment_sample
 
         if len(box_filtered) == 1:
-            return box_filtered[0], segment_filtered[0]
+            return box_slider, box_filtered[0]
 
+        # 第三步：找形状与滑块最相似的 = 缺口
         iou_flag = 0
         iou_index = 0
         for index, segment in enumerate(segment_filtered):
@@ -342,11 +394,45 @@ class Slider:
                 iou_flag = segment_iou
                 iou_index = index
 
-        return box_filtered[iou_index], segment_filtered[iou_index]
+        return box_slider, box_filtered[iou_index]
+
+    # ============================================================
+    # 对外接口：识别缺口
+    # ============================================================
 
     def identify(self, source: Union[str, Path, bytes, np.ndarray], conf=CONF_THRESHOLD, iou=IOU_THRESHOLD, show=False):
-        box_list = []
-        mask_ndarray = None
+        """
+        识别滑块验证码缺口位置（兼容旧接口）
+        
+        返回：
+          (gap_box, confidence)
+          gap_box = [x1, y1, x2, y2] 缺口的左上角和右下角坐标
+          confidence = 0~1 置信度
+        
+        如果没检测到缺口：返回 ([], 0.0)
+        """
+        result = self.identify_both(source, conf=conf, iou=iou, show=show)
+        return result['gap'], result['gap_confidence']
+
+    def identify_both(self, source: Union[str, Path, bytes, np.ndarray], conf=CONF_THRESHOLD, iou=IOU_THRESHOLD, show=False):
+        """
+        同时识别滑块和缺口位置（新版接口）
+        
+        参数：
+          source: 图片输入（路径/base64/字节/numpy数组）
+          conf:   置信度阈值（默认0.5）
+          iou:    NMS IoU阈值（默认0.8）
+          show:   是否显示识别结果（调试用，服务器上别开）
+        
+        返回 dict：
+          slider: [x1, y1, x2, y2] 滑块坐标（空列表=未检测到）
+          slider_confidence: float 滑块置信度
+          gap: [x1, y1, x2, y2] 缺口坐标（空列表=未检测到）
+          gap_confidence: float 缺口置信度
+          offset: int 滑动距离 = 缺口x1 - 滑块x1（0表示无法计算）
+        """
+        slider_box_list = []
+        gap_box_list = []
 
         original_image: np.ndarray = self.image_to_array(source)
         results = self.predict(original_image, conf=conf, iou=iou, imgsz=640)
@@ -354,35 +440,66 @@ class Slider:
         if results:
             boxes, masks = results[0]
             if len(boxes) == 0:
-                pass
+                pass  # 没检测到任何目标
             elif len(boxes) == 1:
-                box_list = boxes[0].tolist()
-                mask_ndarray = masks[0]
-
+                # 只检测到一个目标，无法区分滑块/缺口，当作缺口
+                gap_box_list = boxes[0].tolist()
             else:
+                # 多目标：区分滑块和缺口
                 segments = self.masks_to_segments(masks)
-                box_list, _ = self.pick_out_mask(boxes.tolist(), segments)
-                mask_ndarray = masks[boxes.tolist().index(box_list)]
+                slider_box_list, gap_box_list = self.pick_out_mask(boxes.tolist(), segments)
 
-        # 仅展示目标缺口
-        if show and box_list and mask_ndarray is not None:
-            sample = self.draw_segments(original_image, [box_list, ], [mask_ndarray, ])
-            cv2.imshow('result', sample)
-            cv2.waitKey(0)
-            cv2.destroyAllWindows()
+        # 调试用：显示识别结果
+        if show:
+            draw_boxes = []
+            draw_masks = []
+            boxes_np, masks_np = results[0] if results else (np.zeros((0, 6)), None)
+            if gap_box_list and masks_np is not None:
+                gap_idx = boxes_np.tolist().index(gap_box_list) if gap_box_list in boxes_np.tolist() else -1
+                if gap_idx >= 0:
+                    draw_boxes.append(gap_box_list)
+                    draw_masks.append(masks_np[gap_idx])
+            if slider_box_list and masks_np is not None:
+                slider_idx = boxes_np.tolist().index(slider_box_list) if slider_box_list in boxes_np.tolist() else -1
+                if slider_idx >= 0:
+                    draw_boxes.append(slider_box_list)
+                    draw_masks.append(masks_np[slider_idx])
+            if draw_boxes:
+                sample = self.draw_segments(original_image, draw_boxes, draw_masks)
+                cv2.imshow('result', sample)
+                cv2.waitKey(0)
+                cv2.destroyAllWindows()
 
-        if box_list:
-            box = box_list[:4]
-            box_conf = float(box_list[4])
+        # 提取坐标和置信度
+        slider = [int(x) for x in slider_box_list[:4]] if slider_box_list else []
+        slider_conf = float(slider_box_list[4]) if slider_box_list else 0.0
+        gap = [int(x) for x in gap_box_list[:4]] if gap_box_list else []
+        gap_conf = float(gap_box_list[4]) if gap_box_list else 0.0
+
+        # 计算滑动距离：缺口x1 - 滑块x1
+        # 这就是滑块需要从当前位置滑动到缺口的距离
+        if slider and gap:
+            offset = gap[0] - slider[0]
         else:
-            box = []
-            box_conf = 0.0
-        return box, box_conf
+            offset = 0
+
+        return {
+            'slider': slider,
+            'slider_confidence': slider_conf,
+            'gap': gap,
+            'gap_confidence': gap_conf,
+            'offset': offset,
+        }
 
     def identify_offset(self, source: Union[str, Path, bytes, np.ndarray], conf=CONF_THRESHOLD, iou=IOU_THRESHOLD,
                         show=False):
         """
-        通过滑块图或者全图获取offset
+        识别缺口并直接返回偏移量（滑块初始x坐标）
+        
+        注意：这里返回的 offset 是滑块自身的 x1 坐标，
+        不是滑动距离。要算滑动距离请用 identify_both() 的 offset 字段。
+        
+        用途：某些验证码的滑块有固定偏移量，可用此方法获取
         """
         box_list = []
         mask_ndarray = None
@@ -397,14 +514,12 @@ class Slider:
             elif len(boxes) == 1:
                 box_list = boxes[0].tolist()
                 mask_ndarray = masks[0]
-
             else:
-                # 如果有多个目标，则选择X值最小的目标
+                # 多目标时选 x 最小的（最左边的 = 滑块位置）
                 box_left = min(boxes, key=lambda x: x[0])
                 box_list = box_left.tolist()
                 mask_ndarray = masks[boxes.tolist().index(box_list)]
 
-        # 仅展示目标缺口
         if show and box_list and mask_ndarray is not None:
             sample = self.draw_segments(original_image, [box_list, ], [mask_ndarray, ])
             cv2.imshow('result', sample)
@@ -414,32 +529,20 @@ class Slider:
         if box_list:
             box = box_list[:4]
             box_conf = float(box_list[4])
-            offset = box[0]
+            offset = box[0]  # 缺口/滑块的 x1 坐标
         else:
             offset = 0
             box_conf = 0.0
 
         return offset, box_conf
 
-    def scale_boxes(self, img1_shape: Tuple[int, int], boxes: np.ndarray, img0_shape: Tuple[int, int],
-                    ratio_pad: Union[Tuple, None] = None, padding: bool = True, xywh: bool = False):
-        """
-        Rescale bounding boxes from one image shape to another.
+    # ============================================================
+    # 以下是 YOLO 后处理的标准工具方法
+    # 一般不需要修改，除非换模型
+    # ============================================================
 
-        Rescales bounding boxes from img1_shape to img0_shape, accounting for padding and aspect ratio changes.
-        Supports both xyxy and xywh box formats.
-
-        Args:
-            img1_shape (tuple): Shape of the source image (height, width).
-            boxes (np.ndarray): Bounding boxes to rescale in format (N, 4).
-            img0_shape (tuple): Shape of the target image (height, width).
-            ratio_pad (tuple, optional): Tuple of (ratio, pad) for scaling. If None, calculated from image shapes.
-            padding (bool): Whether boxes are based on YOLO-style augmented images with padding.
-            xywh (bool): Whether box format is xywh (True) or xyxy (False).
-
-        Returns:
-            (np.ndarray): Rescaled bounding boxes in the same format as input.
-        """
+    def scale_boxes(self, img1_shape, boxes, img0_shape, ratio_pad=None, padding=True, xywh=False):
+        """将检测框从模型输入坐标映射回原图坐标（逆letterbox）"""
         if ratio_pad is None:
             gain = min(img1_shape[0] / img0_shape[0], img1_shape[1] / img0_shape[1])
             pad = (
@@ -460,16 +563,8 @@ class Slider:
         return self.clip_boxes(boxes, img0_shape)
 
     @staticmethod
-    def get_covariance_matrix(boxes: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Generate covariance matrix from oriented bounding boxes.
-
-        Args:
-            boxes (np.ndarray): A tensor of shape (N, 5) representing rotated bounding boxes, with xywhr format.
-
-        Returns:
-            (np.ndarray): Covariance matrices corresponding to original rotated bounding boxes.
-        """
+    def get_covariance_matrix(boxes: np.ndarray):
+        """从旋转边界框生成协方差矩阵（用于旋转框NMS）"""
         gbbs = np.concatenate((np.power(boxes[:, 2:4], 2) / 12, boxes[:, 4:]), axis=-1)
         a, b, c = np.split(gbbs, [1, 2], axis=-1)
         cos = np.cos(c)
@@ -478,18 +573,8 @@ class Slider:
         sin2 = np.power(sin, 2)
         return a * cos2 + b * sin2, a * sin2 + b * cos2, (a - b) * cos * sin
 
-    def batch_probiou(self, obb1: np.ndarray, obb2: np.ndarray, eps: float = 1e-7) -> np.ndarray:
-        """
-        Calculate the probabilistic IoU between oriented bounding boxes.
-
-        Args:
-            obb1 (np.ndarray): A tensor of shape (N, 5) representing ground truth obbs, with xywhr format.
-            obb2 (np.ndarray): A tensor of shape (M, 5) representing predicted obbs, with xywhr format.
-            eps (float, optional): A small value to avoid division by zero.
-
-        Returns:
-            (np.ndarray): A tensor of shape (N, M) representing obb similarities.
-        """
+    def batch_probiou(self, obb1, obb2, eps=1e-7):
+        """计算旋转边界框的概率IoU"""
         x1, y1 = np.split(obb1[..., :2], 2, axis=-1)
         x2, y2 = (np.expand_dims(x.squeeze(-1), 0) for x in np.split(obb2[..., :2], 2, axis=-1))
         a1, b1, c1 = self.get_covariance_matrix(obb1)
@@ -506,7 +591,6 @@ class Slider:
 
         denominator = 4 * np.sqrt(term1_log * term2_log) + eps
         t3_numerator = (a1 + a2) * (b1 + b2) - np.power(c1 + c2, 2)
-        # 确保 log 的输入为正值
         t3_arg = np.clip(t3_numerator / denominator + eps, eps, None)
         t3 = np.log(t3_arg) * 0.5
 
@@ -514,55 +598,25 @@ class Slider:
         hd = np.sqrt(1.0 - np.exp(-bd) + eps)
         return 1 - hd
 
-    def nms_rotated(self, boxes: np.ndarray, scores: np.ndarray, threshold: float = 0.45):
-        """
-        Perform NMS on oriented bounding boxes using probiou and fast-nms.
-
-        Args:
-            boxes (np.ndarray): Rotated bounding boxes with shape (N, 5) in xywhr format.
-            scores (np.ndarray): Confidence scores with shape (N,).
-            threshold (float): IoU threshold for NMS.
-
-        Returns:
-            (np.ndarray): Indices of boxes to keep after NMS.
-        """
+    def nms_rotated(self, boxes, scores, threshold=0.45):
+        """旋转边界框的NMS"""
         sorted_idx = np.argsort(scores)[::-1]
         boxes = boxes[sorted_idx]
         ious = self.batch_probiou(boxes, boxes)
-
-        # 使用更高效的方式创建上三角矩阵
         n = boxes.shape[0]
-        ious[np.tril_indices(n)] = 0  # 将下三角和对角线置零
-
+        ious[np.tril_indices(n)] = 0
         pick = np.where((ious >= threshold).sum(axis=0) <= 0)[0]
         return sorted_idx[pick]
 
-    def clip_boxes(self, boxes: np.ndarray, shape: Tuple[int, int]):
-        """
-        Clip bounding boxes to image boundaries.
-
-        Args:
-            boxes (np.ndarray): Bounding boxes to clip.
-            shape (tuple): Image shape as (height, width).
-
-        Returns:
-            (np.ndarray): Clipped bounding boxes.
-        """
+    def clip_boxes(self, boxes, shape):
+        """将检测框裁剪到图片范围内（防止越界）"""
         boxes[..., [0, 2]] = np.clip(boxes[..., [0, 2]], 0, shape[1])
         boxes[..., [1, 3]] = np.clip(boxes[..., [1, 3]], 0, shape[0])
         return boxes
 
     @staticmethod
-    def xywh2xyxy(x: np.ndarray):
-        """
-        Convert bounding box coordinates from (x, y, width, height) format to (x1, y1, x2, y2) format.
-
-        Args:
-            x (np.ndarray): Input bounding box coordinates in (x, y, width, height) format.
-
-        Returns:
-            (np.ndarray): Bounding box coordinates in (x1, y1, x2, y2) format.
-        """
+    def xywh2xyxy(x):
+        """坐标格式转换：中心点+宽高 → 左上角+右下角"""
         assert x.shape[-1] == 4, f"input shape last dimension expected 4 but input shape is {x.shape}"
         y = np.empty_like(x, dtype=np.float32)
         xy = x[..., :2]
@@ -572,42 +626,17 @@ class Slider:
         return y
 
     @staticmethod
-    def crop_mask(masks: np.ndarray, boxes: np.ndarray):
-        """
-        Crop masks to bounding box regions.
-
-        Args:
-            masks (np.ndarray): Masks with shape (N, H, W).
-            boxes (np.ndarray): Bounding box coordinates with shape (N, 4) in relative point form.
-
-        Returns:
-            (np.ndarray): Cropped masks.
-        """
+    def crop_mask(masks, boxes):
+        """将掩膜裁剪到检测框范围内（框外的掩膜置零）"""
         _, h, w = masks.shape
-        # 确保 boxes 的维度正确
         boxes = boxes[:, :, None] if boxes.ndim == 2 else boxes
         x1, y1, x2, y2 = np.split(boxes, 4, axis=1)
         r = np.arange(w, dtype=x1.dtype)[None, None, :]
         c = np.arange(h, dtype=x1.dtype)[None, :, None]
-
         return masks * ((r >= x1) * (r < x2) * (c >= y1) * (c < y2))
 
-    def process_mask_np(self, protos: np.ndarray, masks_in: np.ndarray, bboxes: np.ndarray, shape: Tuple[int, int],
-                        upsample: bool = False):
-        """
-        Apply masks to bounding boxes using mask head output.
-
-        Args:
-            protos (np.ndarray): Mask prototypes with shape (mask_dim, mask_h, mask_w).
-            masks_in (np.ndarray): Mask coefficients with shape (N, mask_dim) where N is number of masks after NMS.
-            bboxes (np.ndarray): Bounding boxes with shape (N, 4) where N is number of masks after NMS.
-            shape (tuple): Input image size as (height, width).
-            upsample (bool): Whether to upsample masks to original image size.
-
-        Returns:
-            (np.ndarray): A binary mask array of shape [n, h, w], where n is the number of masks after NMS, and h and w
-                are the height and width of the input image. The mask is applied to the bounding boxes.
-        """
+    def process_mask_np(self, protos, masks_in, bboxes, shape, upsample=False):
+        """另一版本的掩膜处理（带下采样坐标映射）"""
         c, mh, mw = protos.shape
         ih, iw = shape
 
@@ -630,16 +659,8 @@ class Slider:
         return masks > 0.0
 
     @staticmethod
-    def scale_masks(masks: np.ndarray, shape: Tuple[int, int], padding: bool = True):
-        """
-        Rescale segment masks to target shape.
-        Args:
-            masks (np.ndarray): Masks with shape (N, H, W).
-            shape (tuple): Target height and width as (height, width).
-            padding (bool): Whether masks are based on YOLO-style augmented images with padding.
-        Returns:
-            (np.ndarray): Rescaled masks with shape (N, H_new, W_new).
-        """
+    def scale_masks(masks, shape, padding=True):
+        """将掩膜从模型输出尺寸缩放到原图尺寸"""
         mh, mw = masks.shape[1:]
         gain = min(mh / shape[0], mw / shape[1])
         pad = [mw - shape[1] * gain, mh - shape[0] * gain]
@@ -649,45 +670,31 @@ class Slider:
             pad[1] /= 2
 
         top, left = (int(round(pad[1])), int(round(pad[0]))) if padding else (0, 0)
-        bottom, right = (
-            mh - int(round(pad[1])),
-            mw - int(round(pad[0])),
-        )
+        bottom, right = (mh - int(round(pad[1])), mw - int(round(pad[0])))
 
-        # Crop the masks first
         masks_cropped = masks[:, top:bottom, left:right]
 
-        # 向量化 resize 操作
         resized_masks = np.zeros((masks_cropped.shape[0], shape[0], shape[1]), dtype=masks_cropped.dtype)
         for i, mask in enumerate(masks_cropped):
             resized_masks[i] = cv2.resize(mask, (shape[1], shape[0]), interpolation=cv2.INTER_LINEAR)
 
         return resized_masks
 
-    def non_max_suppression(
-            self,
-            prediction: np.ndarray,
-            conf_thres: float = 0.25,
-            iou_thres: float = 0.45,
-            classes=None,
-            agnostic: bool = False,
-            multi_label: bool = False,
-            labels=(),
-            max_det: int = 300,
-            nc: int = 0,
-            max_time_img: float = 0.05,
-            max_nms: int = 30000,
-            max_wh: int = 7680,
-            in_place: bool = True,
-            rotated: bool = False,
-            end2end: bool = False,
-            return_idxs: bool = False,
-    ):
+    def non_max_suppression(self, prediction, conf_thres=0.25, iou_thres=0.45,
+                            classes=None, agnostic=False, multi_label=False, labels=(),
+                            max_det=300, nc=0, max_time_img=0.05, max_nms=30000,
+                            max_wh=7680, in_place=True, rotated=False, end2end=False,
+                            return_idxs=False):
         """
-        Perform non-maximum suppression (NMS) on prediction results.
+        非极大值抑制（NMS）
+        
+        作用：模型可能对同一个目标检测出多个重叠的框，
+        NMS 会保留分数最高的，去掉与它重叠太多的其他框。
+        
+        一般不需要改这里的参数，调 CONF_THRESHOLD 和 IOU_THRESHOLD 就够了
         """
-        assert 0 <= conf_thres <= 1, f"Invalid Confidence threshold {conf_thres}, valid values are between 0.0 and 1.0"
-        assert 0 <= iou_thres <= 1, f"Invalid IoU {iou_thres}, valid values are between 0.0 and 1.0"
+        assert 0 <= conf_thres <= 1, f"Invalid Confidence threshold {conf_thres}"
+        assert 0 <= iou_thres <= 1, f"Invalid IoU {iou_thres}"
 
         if isinstance(prediction, (list, tuple)):
             prediction = prediction[0]
@@ -724,7 +731,6 @@ class Slider:
             filt = xc[xi]
             x, xk = x[filt], xk[filt]
 
-            # 增强 labels 的健壮性
             if labels and len(labels) > xi and len(labels[xi]) and not rotated:
                 lb = np.array(labels[xi])
                 if lb.size > 0:
@@ -768,7 +774,6 @@ class Slider:
                 i = self.nms_rotated(boxes, scores, iou_thres)
             else:
                 boxes = x[:, :4] + c
-                # Custom NMS for numpy
                 i = []
                 if boxes.shape[0] > 0:
                     y1, x1, y2, x2 = boxes[:, 1], boxes[:, 0], boxes[:, 3], boxes[:, 2]
@@ -798,12 +803,10 @@ class Slider:
 
 
 if __name__ == "__main__":
-    """
-    单缺口
-    """
+    """本地测试：直接运行识别单张图片"""
     model = Slider()
-    # base64 图片测试
-    # base64_image = 'xxx'
-    # res = model.identify(source=base64_image, show=True)
-    res = model.identify(source='img_example.png', show=True)
-    print('results', res)
+    # 测试新版接口（同时返回滑块和缺口）
+    res = model.identify_both(source='img_example.png', show=True)
+    print(f'滑块: {res["slider"]}, 置信度: {res["slider_confidence"]}')
+    print(f'缺口: {res["gap"]}, 置信度: {res["gap_confidence"]}')
+    print(f'滑动距离: {res["offset"]}')
