@@ -1,0 +1,8 @@
+opencv-python-headless
+shapely
+onnxruntime
+fastapi
+uvicorn
+python-multipart
+pydantic
+py-ip2region
