@@ -18,7 +18,7 @@ app_port: 7860
 | `GET` | `/` | 根路径健康检查 |
 | `GET` | `/health` | 部署平台健康检查 |
 | `GET` | `/ip?ip=8.8.8.8` | IP 归属地查询，自动识别 IPv4/IPv6 |
-| `POST` | `/ip` | IP 归属地查询，JSON 传入 `{"ip":"8.8.8.8"}` |
+| `POST` | `/ip` | IP 归属地查询，支持 JSON、`ip=xxx`、纯 IP 文本 |
 | `POST` | `/slide` | 上传图片文件，只返回滑块位置 |
 | `POST` | `/slide-base64` | 上传 base64 图片，只返回滑块位置 |
 | `POST` | `/hole` | 上传图片文件，只返回缺口位置 |
@@ -30,18 +30,20 @@ app_port: 7860
 
 ## 基础地址
 
-部署到 Hugging Face Spaces 后，把下面示例里的地址替换成你的 Space 地址：
+推荐通过代理域名访问：
 
 ```text
-https://your-space.hf.space
+https://hf-api.lze.cc.cd
 ```
+
+如果你是自行部署，也可以把示例里的域名替换成自己的服务地址。
 
 ## 健康检查
 
 ### 根路径
 
 ```bash
-curl "https://your-space.hf.space/"
+curl "https://hf-api.lze.cc.cd/"
 ```
 
 返回示例：
@@ -56,7 +58,7 @@ curl "https://your-space.hf.space/"
 ### health
 
 ```bash
-curl "https://your-space.hf.space/health"
+curl "https://hf-api.lze.cc.cd/health"
 ```
 
 返回示例：
@@ -79,21 +81,52 @@ data/ip2region_v6.xdb
 ### GET 查询
 
 ```bash
-curl "https://your-space.hf.space/ip?ip=8.8.8.8"
+curl "https://hf-api.lze.cc.cd/ip?ip=8.8.8.8"
 ```
 
 IPv6 示例：
 
 ```bash
-curl "https://your-space.hf.space/ip?ip=240e:3b7:3272:d8d0:db09:c067:8d59:539e"
+curl "https://hf-api.lze.cc.cd/ip?ip=240e:3b7:3272:d8d0:db09:c067:8d59:539e"
 ```
 
-### POST 查询
+### POST JSON 查询
 
 ```bash
-curl -X POST "https://your-space.hf.space/ip" \
+curl -X POST "https://hf-api.lze.cc.cd/ip" \
   -H "Content-Type: application/json" \
   -d '{"ip":"8.8.8.8"}'
+```
+
+### POST 表单字符串查询
+
+```bash
+curl -X POST "https://hf-api.lze.cc.cd/ip" \
+  -d "ip=113.118.113.77"
+```
+
+### POST 纯文本查询
+
+```bash
+curl -X POST "https://hf-api.lze.cc.cd/ip" \
+  -H "Content-Type: text/plain" \
+  -d "113.118.113.77"
+```
+
+### 懒人精灵调用
+
+```lua
+local ret, code = httpPost("https://hf-api.lze.cc.cd/ip", "ip=113.118.113.77", 10)
+print("状态码：" .. tostring(code))
+print("返回内容：" .. tostring(ret))
+```
+
+GET 也可以：
+
+```lua
+local ret, code = httpGet("https://hf-api.lze.cc.cd/ip?ip=113.118.113.77", 10)
+print("状态码：" .. tostring(code))
+print("返回内容：" .. tostring(ret))
 ```
 
 ### 返回示例
@@ -131,7 +164,7 @@ curl -X POST "https://your-space.hf.space/ip" \
 ### 上传图片文件
 
 ```bash
-curl -X POST "https://your-space.hf.space/slide" \
+curl -X POST "https://hf-api.lze.cc.cd/slide" \
   -F "file=@captcha.png"
 ```
 
@@ -148,7 +181,7 @@ curl -X POST "https://your-space.hf.space/slide" \
 ### 上传 base64
 
 ```bash
-curl -X POST "https://your-space.hf.space/slide-base64" \
+curl -X POST "https://hf-api.lze.cc.cd/slide-base64" \
   -H "Content-Type: application/json" \
   -d '{"image":"base64字符串"}'
 ```
@@ -164,7 +197,7 @@ curl -X POST "https://your-space.hf.space/slide-base64" \
 ### 上传图片文件
 
 ```bash
-curl -X POST "https://your-space.hf.space/hole" \
+curl -X POST "https://hf-api.lze.cc.cd/hole" \
   -F "file=@captcha.png"
 ```
 
@@ -181,7 +214,7 @@ curl -X POST "https://your-space.hf.space/hole" \
 ### 上传 base64
 
 ```bash
-curl -X POST "https://your-space.hf.space/hole-base64" \
+curl -X POST "https://hf-api.lze.cc.cd/hole-base64" \
   -H "Content-Type: application/json" \
   -d '{"image":"base64字符串"}'
 ```
@@ -191,7 +224,7 @@ curl -X POST "https://your-space.hf.space/hole-base64" \
 ### 上传图片文件
 
 ```bash
-curl -X POST "https://your-space.hf.space/puzzle" \
+curl -X POST "https://hf-api.lze.cc.cd/puzzle" \
   -F "file=@captcha.png"
 ```
 
@@ -217,7 +250,7 @@ curl -X POST "https://your-space.hf.space/puzzle" \
 ### 上传 base64
 
 ```bash
-curl -X POST "https://your-space.hf.space/puzzle-base64" \
+curl -X POST "https://hf-api.lze.cc.cd/puzzle-base64" \
   -H "Content-Type: application/json" \
   -d '{"image":"base64字符串"}'
 ```
@@ -241,7 +274,7 @@ curl -X POST "https://your-space.hf.space/puzzle-base64" \
 ### 上传图片文件
 
 ```bash
-curl -X POST "https://your-space.hf.space/visualize" \
+curl -X POST "https://hf-api.lze.cc.cd/visualize" \
   -F "file=@captcha.png"
 ```
 
@@ -262,7 +295,7 @@ curl -X POST "https://your-space.hf.space/visualize" \
 ### 上传 base64
 
 ```bash
-curl -X POST "https://your-space.hf.space/visualize-base64" \
+curl -X POST "https://hf-api.lze.cc.cd/visualize-base64" \
   -H "Content-Type: application/json" \
   -d '{"image":"base64字符串"}'
 ```
