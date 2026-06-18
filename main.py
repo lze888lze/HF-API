@@ -49,8 +49,10 @@
 
 import gc       # 垃圾回收，手动释放内存（HF免费层512MB）
 import ipaddress  # IP 地址格式校验和 IPv4/IPv6 识别
+import json      # 解析 JSON 请求体
 import os       # 读取环境变量（端口号）
 import time     # 时间戳生成文件名
+import urllib.parse  # 解析 ip=xxx 表单字符串
 import uuid     # 唯一ID
 from pathlib import Path
 from typing import Optional
@@ -60,7 +62,7 @@ import cv2      # OpenCV，图片解码
 import numpy as np  # 数组操作
 
 from captcha_recognizer.slider import Slider  # 核心：滑块识别模型
-from fastapi import FastAPI, File, Query, UploadFile  # Web 框架
+from fastapi import FastAPI, File, Query, Request, UploadFile  # Web 框架
 from fastapi.middleware.cors import CORSMiddleware  # 跨域支持
 import ip2region.searcher as ip2region_xdb  # ip2region xdb 查询器
 import ip2region.util as ip2region_util  # ip2region 工具方法
@@ -292,14 +294,37 @@ def ip_lookup(ip: str = Query(..., description="要查询的 IPv4 或 IPv6 地�
 
 
 @app.post("/ip")
-async def ip_lookup_post(data: dict):
+async def ip_lookup_post(request: Request):
     """
     POST 查询 IP 归属地
 
-    请求格式：
+    支持多种请求格式，方便不同客户端调用：
       {"ip": "8.8.8.8"}
+      ip=8.8.8.8
+      8.8.8.8
     """
-    return _lookup_ip(data.get("ip", ""))
+    body = (await request.body()).decode("utf-8", errors="ignore").strip()
+    ip = ""
+
+    if body:
+        # JSON：{"ip":"8.8.8.8"}
+        try:
+            data = json.loads(body)
+            if isinstance(data, dict):
+                ip = data.get("ip", "")
+        except Exception:
+            pass
+
+        # 表单字符串：ip=8.8.8.8
+        if not ip and "=" in body:
+            form_data = urllib.parse.parse_qs(body)
+            ip = (form_data.get("ip") or [""])[0]
+
+        # 纯文本：8.8.8.8
+        if not ip:
+            ip = body
+
+    return _lookup_ip(ip)
 
 
 # ============================================================
