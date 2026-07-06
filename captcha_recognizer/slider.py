@@ -43,10 +43,9 @@ IOU_THRESHOLD = 0.8    # NMS（非极大值抑制）的 IoU 阈值
 Y_IOU_THRESHOLD = 0.85  # Y轴方向 IoU 阈值，用于 pick_out_mask
                         # 判断两个目标是否在"同一水平线"上（滑块和缺口通常y位置接近）
 
-# 模型输入尺寸：越小越快，越大越准
-# 640 = 高精度 / 416 = 平衡 / 320 = 极速
-# 可通过环境变量 MODEL_IMGSZ 调整
-DEFAULT_IMGSZ = int(os.environ.get("MODEL_IMGSZ", 416))
+# 模型输入尺寸：ONNX 模型训练时固定的尺寸，不可更改
+# 当前 slider.onnx 模型的输入尺寸为 640x640
+DEFAULT_IMGSZ = int(os.environ.get("MODEL_IMGSZ", 640))
 
 
 class Slider:
