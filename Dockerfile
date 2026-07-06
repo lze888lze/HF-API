@@ -6,10 +6,8 @@ WORKDIR /home/user/app
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
-    OMP_NUM_THREADS=4 \
-    OPENCV_FOR_THREADS_NUM=4 \
-    MKL_NUM_THREADS=4 \
-    NUMEXPR_NUM_THREADS=4
+    OMP_NUM_THREADS=1 \
+    OPENCV_FOR_THREADS_NUM=1
 
 # 安装系统依赖（OpenCV需要）
 RUN apt-get update && apt-get install -y --no-install-recommends \
