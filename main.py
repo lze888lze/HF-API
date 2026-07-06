@@ -47,7 +47,6 @@
     }
 """
 
-import gc       # 垃圾回收，手动释放内存（HF免费层512MB）
 import ipaddress  # IP 地址格式校验和 IPv4/IPv6 识别
 import json      # 解析 JSON 请求体
 import os       # 读取环境变量（端口号）
@@ -353,10 +352,6 @@ def _recognize(image_bytes: bytes) -> dict:
     # 调用模型，同时获取滑块和缺口的原始结果
     result = slider_model.identify_both(source=image)
 
-    # 手动释放内存（HF 免费层内存有限，防止 OOM）
-    del image, nparr
-    gc.collect()
-
     return result
 
 
@@ -635,10 +630,6 @@ def _draw_box_and_upload(image_bytes: bytes) -> tuple:
     # 上传到 R2
     filename = generate_image_filename()
     image_url = upload_to_r2(output_bytes, filename)
-
-    # 清理内存
-    del image, nparr, output, buffer, output_bytes
-    gc.collect()
 
     return result, image_url
 
