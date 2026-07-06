@@ -11,11 +11,9 @@ services:
       - "7860:7860"
     env_file:
       - .env
-    environment:
-      # ONNX线程数：默认自动检测；2核CPU建议设为2，1核建议设为1
-      # 注释掉以下两行让ONNX自动检测
-      # - ONNX_INTRA_THREADS=2
-      # - ONNX_INTER_THREADS=1
+    # 如需调整ONNX线程数，在 .env 文件中添加：
+    # ONNX_INTRA_THREADS=1
+    # ONNX_INTER_THREADS=1
     deploy:
       resources:
         limits:
