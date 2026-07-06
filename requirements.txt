@@ -1,8 +1,10 @@
 opencv-python-headless
 onnxruntime
 fastapi
-uvicorn
+uvicorn[standard]
 python-multipart
 pydantic
 boto3
 py-ip2region
+uvloop
+httptools
