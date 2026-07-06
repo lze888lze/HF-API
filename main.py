@@ -753,14 +753,11 @@ if __name__ == "__main__":
     # HF Spaces 要求从环境变量读端口号，默认 7860
     # 本地开发时直接 python main.py 即可启动
     port = int(os.environ.get("PORT", 7860))
-    workers = int(os.environ.get("WORKERS", 1))
 
     uvicorn.run(
-        "main:app",           # 用字符串形式才能配合多 workers
+        app,
         host="0.0.0.0",
         port=port,
         loop=loop,
-        http="httptools",      # 更快的高性能 HTTP 解析器
-        workers=workers,        # 多进程并发，2 核可设 2
-        limit_concurrency=100,  # 限制并发连接数
+        http="httptools",  # 更快的高性能 HTTP 解析器
     )
