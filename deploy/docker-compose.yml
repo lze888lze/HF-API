@@ -11,14 +11,16 @@ services:
       - "7860:7860"
     env_file:
       - .env
-    # 如需调整ONNX线程数，在 .env 文件中添加：
-    # ONNX_INTRA_THREADS=1
-    # ONNX_INTER_THREADS=1
-    # WORKERS: worker 进程数，建议设为 CPU 核心数（2 核设 2）
-    # 单进程足够自己用；多用户并发场景建议设 2-4
     environment:
       - WORKERS=1
+      - ONNX_INTRA_THREADS=4
     deploy:
       resources:
         limits:
           memory: 4G
+          cpus: "2.0"
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

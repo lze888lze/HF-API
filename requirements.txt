@@ -1,5 +1,5 @@
 opencv-python-headless
-onnxruntime
+onnxruntime-gpu
 fastapi
 uvicorn[standard]
 python-multipart
