@@ -58,19 +58,15 @@ class Slider:
         root_dir = os.path.dirname(os.path.dirname(__file__))
         slider_model_path = os.path.join(root_dir, 'captcha_recognizer', 'models', 'slider.onnx')
 
-        # 优化 ONNX Runtime 会话配置
+        # ONNX Runtime 会话配置
+        # 使用默认优化级别，ORT_ENABLE_ALL 可能对某些模型引入额外开销
         so = ort.SessionOptions()
-        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        # 线程数：默认自动（ONNX 自行检测），可通过环境变量覆盖
-        # Oracle 免费实例建议设 ONNX_INTRA_THREADS=1（单核多线程反而慢）
         intra_threads = os.environ.get("ONNX_INTRA_THREADS")
         if intra_threads is not None:
             so.intra_op_num_threads = int(intra_threads)
         inter_threads = os.environ.get("ONNX_INTER_THREADS")
         if inter_threads is not None:
             so.inter_op_num_threads = int(inter_threads)
-        so.enable_mem_pattern = True
-        so.enable_cpu_mem_arena = True
 
         # 根据是否有 GPU 选择推理设备
         # HF Spaces 免费层没有 GPU，所以通常走 CPUExecutionProvider

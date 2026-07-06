@@ -12,11 +12,10 @@ services:
     env_file:
       - .env
     environment:
-      # 2核CPU，ONNX_INTRA_THREADS=2 最优；1核建议设为1
-      - ONNX_INTRA_THREADS=2
-      - ONNX_INTER_THREADS=1
-      - OMP_NUM_THREADS=2
-      - OPENCV_FOR_THREADS_NUM=2
+      # ONNX线程数：默认自动检测；2核CPU建议设为2，1核建议设为1
+      # 注释掉以下两行让ONNX自动检测
+      # - ONNX_INTRA_THREADS=2
+      # - ONNX_INTER_THREADS=1
     deploy:
       resources:
         limits:
