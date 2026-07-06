@@ -61,10 +61,14 @@ class Slider:
         # 优化 ONNX Runtime 会话配置
         so = ort.SessionOptions()
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        # 线程数：Oracle 免费实例通常为 1 OCPU，设置过多线程反而因调度开销变慢
-        # 默认值 1（单线程最快），可通过环境变量覆盖
-        so.intra_op_num_threads = int(os.environ.get("ONNX_INTRA_THREADS", 1))
-        so.inter_op_num_threads = int(os.environ.get("ONNX_INTER_THREADS", 1))
+        # 线程数：默认自动（ONNX 自行检测），可通过环境变量覆盖
+        # Oracle 免费实例建议设 ONNX_INTRA_THREADS=1（单核多线程反而慢）
+        intra_threads = os.environ.get("ONNX_INTRA_THREADS")
+        if intra_threads is not None:
+            so.intra_op_num_threads = int(intra_threads)
+        inter_threads = os.environ.get("ONNX_INTER_THREADS")
+        if inter_threads is not None:
+            so.inter_op_num_threads = int(inter_threads)
         so.enable_mem_pattern = True
         so.enable_cpu_mem_arena = True
 

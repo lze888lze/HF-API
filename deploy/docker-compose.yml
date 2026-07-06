@@ -11,6 +11,12 @@ services:
       - "7860:7860"
     env_file:
       - .env
+    environment:
+      # Oracle 免费实例通常为 1 OCPU，单线程最快；升级实例后可调高
+      - ONNX_INTRA_THREADS=1
+      - ONNX_INTER_THREADS=1
+      - OMP_NUM_THREADS=1
+      - OPENCV_FOR_THREADS_NUM=1
     deploy:
       resources:
         limits:
