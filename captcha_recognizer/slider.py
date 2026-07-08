@@ -46,7 +46,7 @@ Y_IOU_THRESHOLD = 0.85  # Y轴方向 IoU 阈值，用于 pick_out_mask
 # 模型输入尺寸：越小越快，越大越准
 # 640 = 高精度 / 416 = 平衡 / 320 = 极速
 # 可通过环境变量 MODEL_IMGSZ 调整
-DEFAULT_IMGSZ = int(os.environ.get("MODEL_IMGSZ", 416))
+DEFAULT_IMGSZ = int(os.environ.get("MODEL_IMGSZ", 640))
 
 
 class Slider:
