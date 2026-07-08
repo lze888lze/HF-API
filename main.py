@@ -94,6 +94,27 @@ slider_model = Slider()
 
 
 # ============================================================
+# 预热：服务启动后立即用一张假图片跑一次推理
+# 目的：让 ONNX Runtime 完成算子编译、内存分配、首次 JIT 优化
+# 效果：用户的第一次请求不会再触发额外的冷启动开销
+# ============================================================
+def _warmup_model():
+    """用一张空白图片跑一次推理，让模型进入"热启动"状态"""
+    try:
+        import numpy as np
+        # 构造一张 640x640 的黑色图片（和模型期望的输入尺寸一致）
+        dummy_image = np.zeros((640, 640, 3), dtype=np.uint8)
+        slider_model.identify_both(source=dummy_image)
+        print("✅ 模型预热完成")
+    except Exception as e:
+        print(f"⚠️ 模型预热失败（不影响服务）: {e}")
+
+
+# 服务启动时执行预热
+_warmup_model()
+
+
+# ============================================================
 # IP 归属地库加载（服务启动时验证并缓存 VectorIndex）
 # ============================================================
 # xdb 文件放在项目 data 目录，Docker 部署时会随 COPY . . 一起带到 HF Spaces
@@ -721,7 +742,21 @@ async def puzzle_visualize_base64(data: dict):
 # ============================================================
 if __name__ == "__main__":
     import uvicorn
+    # 优先使用 uvloop（比 Python 默认 asyncio 快 2-4 倍）
+    # Linux 系统支持 uvloop；不支持时自动降级为默认 asyncio
+    try:
+        import uvloop
+        loop = "uvloop"
+    except ImportError:
+        loop = "asyncio"
+
     # HF Spaces 要求从环境变量读端口号，默认 7860
     # 本地开发时直接 python main.py 即可启动
     port = int(os.environ.get("PORT", 7860))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port,
+        loop=loop,
+        http="httptools",  # 更快的高性能 HTTP 解析器
+    )
