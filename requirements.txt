@@ -1,5 +1,5 @@
 opencv-python-headless
-onnxruntime>=1.27.0
+onnxruntime
 fastapi
 uvicorn
 uvloop
