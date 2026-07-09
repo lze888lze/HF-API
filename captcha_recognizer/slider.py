@@ -52,19 +52,26 @@ class Slider:
     def __init__(self):
         """
         初始化：加载 ONNX 模型文件
-        模型路径: captcha_recognizer/models/slider.onnx
+        优先尝试 INT8 静态量化模型，如果加载失败则自动降级到 FP32
         """
         root_dir = os.path.dirname(os.path.dirname(__file__))
-        slider_model_path = os.path.join(root_dir, 'captcha_recognizer', 'models', 'slider.onnx')
+        int8_path = os.path.join(root_dir, 'captcha_recognizer', 'models', 'slider_int8.onnx')
+        fp32_path = os.path.join(root_dir, 'captcha_recognizer', 'models', 'slider.onnx')
 
         so = ort.SessionOptions()
         providers = ["CPUExecutionProvider"]
 
-        self.session = ort.InferenceSession(
-            slider_model_path,
-            sess_options=so,
-            providers=providers,
-        )
+        if os.path.exists(int8_path):
+            try:
+                self.session = ort.InferenceSession(int8_path, sess_options=so, providers=providers)
+                print(f"✅ 加载静态量化模型: {int8_path}")
+            except Exception as e:
+                print(f"⚠️ INT8 模型加载失败: {e}")
+                self.session = ort.InferenceSession(fp32_path, sess_options=so, providers=providers)
+                print(f"🔄 降级到 FP32 模型: {fp32_path}")
+        else:
+            self.session = ort.InferenceSession(fp32_path, sess_options=so, providers=providers)
+            print(f"✅ 加载 FP32 模型: {fp32_path}")
 
         self.classes = {0: 's'}
 
