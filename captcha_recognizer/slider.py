@@ -55,7 +55,10 @@ class Slider:
         模型路径: captcha_recognizer/models/slider.onnx
         """
         root_dir = os.path.dirname(os.path.dirname(__file__))
-        slider_model_path = os.path.join(root_dir, 'captcha_recognizer', 'models', 'slider.onnx')
+        # 优先使用动态量化模型（INT8），如果不存在则用原模型（FP32）
+        int8_path = os.path.join(root_dir, 'captcha_recognizer', 'models', 'slider_int8.onnx')
+        fp32_path = os.path.join(root_dir, 'captcha_recognizer', 'models', 'slider.onnx')
+        slider_model_path = int8_path if os.path.exists(int8_path) else fp32_path
 
         # ONNX Runtime 会话配置（使用默认配置，避免过度优化反而变慢）
         so = ort.SessionOptions()
