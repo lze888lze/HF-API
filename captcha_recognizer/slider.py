@@ -58,8 +58,7 @@ class Slider:
         slider_model_path = os.path.join(root_dir, 'captcha_recognizer', 'models', 'slider.onnx')
 
         so = ort.SessionOptions()
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if ort.get_device() == 'GPU' else [
-            "CPUExecutionProvider"]
+        providers = ["CPUExecutionProvider"]
 
         self.session = ort.InferenceSession(
             slider_model_path,
