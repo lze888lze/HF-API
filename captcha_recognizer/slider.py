@@ -43,10 +43,8 @@ IOU_THRESHOLD = 0.8    # NMS（非极大值抑制）的 IoU 阈值
 Y_IOU_THRESHOLD = 0.85  # Y轴方向 IoU 阈值，用于 pick_out_mask
                         # 判断两个目标是否在"同一水平线"上（滑块和缺口通常y位置接近）
 
-# 模型输入尺寸：越小越快，越大越准
-# 640 = 高精度 / 416 = 平衡 / 320 = 极速
-# 可通过环境变量 MODEL_IMGSZ 调整
-DEFAULT_IMGSZ = int(os.environ.get("MODEL_IMGSZ", 640))
+# 模型输入尺寸：模型固定为 640x640，不可更改
+DEFAULT_IMGSZ = 640
 
 
 class Slider:
@@ -57,12 +55,12 @@ class Slider:
         模型路径: captcha_recognizer/models/slider.onnx
         """
         root_dir = os.path.dirname(os.path.dirname(__file__))
-        slider_model_path = os.path.join(root_dir, 'captcha_recognizer', 'models', 'slider.onnx')
+        # 优先使用量化模型（INT8），如果不存在则用原模型（FP32）
+        int8_path = os.path.join(root_dir, 'captcha_recognizer', 'models', 'slider_int8.onnx')
+        fp32_path = os.path.join(root_dir, 'captcha_recognizer', 'models', 'slider.onnx')
+        slider_model_path = int8_path if os.path.exists(int8_path) else fp32_path
 
-        # ONNX Runtime 会话配置
-        # 注意：经过实测，在 Oracle 免费实例（共享 CPU）上，手动开启图优化
-        # 和强制设置多线程反而会导致性能下降和波动。因此这里使用默认配置，
-        # 让 ONNX Runtime 自己根据环境选择最优策略。
+        # ONNX Runtime 会话配置（使用默认配置，避免过度优化反而变慢）
         so = ort.SessionOptions()
 
         # 根据是否有 GPU 选择推理设备
