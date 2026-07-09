@@ -53,29 +53,37 @@ class Slider:
         """
         初始化：加载 ONNX 模型文件
         模型路径: captcha_recognizer/models/slider.onnx
+        
+        优先尝试 INT8 动态量化模型，如果加载失败（ONNX Runtime版本太低）则自动降级到 FP32
         """
         root_dir = os.path.dirname(os.path.dirname(__file__))
-        # 优先使用动态量化模型（INT8），如果不存在则用原模型（FP32）
         int8_path = os.path.join(root_dir, 'captcha_recognizer', 'models', 'slider_int8.onnx')
         fp32_path = os.path.join(root_dir, 'captcha_recognizer', 'models', 'slider.onnx')
-        slider_model_path = int8_path if os.path.exists(int8_path) else fp32_path
 
-        # ONNX Runtime 会话配置（使用默认配置，避免过度优化反而变慢）
         so = ort.SessionOptions()
-
-        # 根据是否有 GPU 选择推理设备
-        # HF Spaces 免费层没有 GPU，所以通常走 CPUExecutionProvider
         providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if ort.get_device() == 'GPU' else [
             "CPUExecutionProvider"]
 
-        self.session = ort.InferenceSession(
-            slider_model_path,
-            sess_options=so,
-            providers=providers,
-        )
+        # 优先尝试 INT8 模型
+        slider_model_path = int8_path if os.path.exists(int8_path) else fp32_path
+        
+        try:
+            self.session = ort.InferenceSession(
+                slider_model_path,
+                sess_options=so,
+                providers=providers,
+            )
+            print(f"✅ 加载量化模型: {slider_model_path}")
+        except Exception as e:
+            # INT8 模型加载失败，降级到 FP32
+            print(f"⚠️ INT8 模型加载失败: {e}")
+            print(f"🔄 降级到 FP32 模型: {fp32_path}")
+            self.session = ort.InferenceSession(
+                fp32_path,
+                sess_options=so,
+                providers=providers,
+            )
 
-        # 模型类别：只有一类 's'（slider/缺口）
-        # 如果以后换成多类别模型，这里要加
         self.classes = {0: 's'}
 
     # ============================================================
